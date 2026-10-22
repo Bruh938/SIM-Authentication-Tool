@@ -30,19 +30,44 @@ def h2b(s: str) -> bytes:
 
 
 def apdu_run_gsm(rand: bytes) -> bytes:
-    """RUN GSM ALGORITHM, TS 51.011 sec 9.2. Must be sent under DF_GSM (7F20).
-    CLA=A0 INS=88 P1=00 P2=00 Lc=10 <RAND:16> Le=00
-    """
+    """Legacy SIM RUN GSM ALGORITHM, TS 51.011 sec. 9.2 (CLA=A0)."""
     if len(rand) != 16:
         raise ValueError(f"RAND must be 16 bytes, got {len(rand)}")
     return bytes([0xA0, 0x88, 0x00, 0x00, 0x10]) + rand + bytes([0x00])
 
 
+def apdu_authenticate_gsm(rand: bytes) -> bytes:
+    """USIM AUTHENTICATE in GSM context, TS 31.102 sec. 7.1.2.1 (CLA=00).
+
+    GSM context carries LV(RAND) only (no AUTN). P2=80 selects GSM context.
+    """
+    if len(rand) != 16:
+        raise ValueError(f"RAND must be 16 bytes, got {len(rand)}")
+    data = bytes([len(rand)]) + rand
+    return bytes([0x00, 0x88, 0x00, 0x80, len(data)]) + data + bytes([0x00])
+
+
 def parse_run_gsm_resp(data: bytes) -> dict:
-    """Classic SIM response is a raw concatenation, no TLV: SRES(4) || Kc(8)."""
+    """Legacy SIM response is a raw concatenation: SRES(4) || Kc(8)."""
     if len(data) < 12:
         raise ValueError(f"Expected 12 bytes (SRES+Kc), got {len(data)}: {data.hex()}")
     return {"sres": data[0:4], "kc": data[4:12]}
+
+
+def parse_usim_gsm_resp(data: bytes) -> dict:
+    """USIM GSM-context response: LV(SRES) || LV(Kc), without a DB tag."""
+    if len(data) < 2:
+        raise ValueError(f"Expected LV(SRES)||LV(Kc), got {len(data)} bytes: {data.hex()}")
+    sres_len = data[0]
+    if sres_len != 4 or len(data) < 1 + sres_len + 1:
+        raise ValueError(f"Invalid USIM GSM SRES length/response: {data.hex()}")
+    sres = data[1:1 + sres_len]
+    kc_len_offset = 1 + sres_len
+    kc_len = data[kc_len_offset]
+    kc_start = kc_len_offset + 1
+    if kc_len != 8 or len(data) != kc_start + kc_len:
+        raise ValueError(f"Invalid USIM GSM Kc length/response: {data.hex()}")
+    return {"sres": sres, "kc": data[kc_start:kc_start + kc_len]}
 
 
 def apdu_authenticate(rand: bytes, autn: bytes, context: str = "3g") -> bytes:
@@ -126,8 +151,9 @@ def transmit(conn, apdu: bytes, label: str = "", verbose: bool = True):
     if verbose and label:
         print(f"  -> {label}: {bytes(apdu_list).hex()}")
         print(f"  <- {bytes(data).hex()} SW={sw1:02X}{sw2:02X}")
-    if sw1 == 0x61:  # more data available -> GET RESPONSE
-        get_resp = [0x00, 0xC0, 0x00, 0x00, sw2]
+    if sw1 in (0x61, 0x9F):  # more data available (UICC / legacy SIM)
+        get_cla = 0xA0 if sw1 == 0x9F else 0x00
+        get_resp = [get_cla, 0xC0, 0x00, 0x00, sw2]
         data, sw1, sw2 = conn.transmit(get_resp)
         if verbose:
             print(f"  <- (GET RESPONSE) {bytes(data).hex()} SW={sw1:02X}{sw2:02X}")
@@ -139,9 +165,15 @@ def transmit(conn, apdu: bytes, label: str = "", verbose: bool = True):
     return bytes(data), sw1, sw2
 
 
-def select(conn, fid_or_aid: bytes, by_aid: bool = False, verbose: bool = True) -> bytes:
+def select(conn, fid_or_aid: bytes, by_aid: bool = False,
+           verbose: bool = True, cla: int = 0x00) -> bytes:
+    if by_aid and cla != 0x00:
+        raise ValueError("ADF selection by AID must use CLA=00")
     p1 = 0x04 if by_aid else 0x00
-    apdu = bytes([0x00, 0xA4, p1, 0x04, len(fid_or_aid)]) + fid_or_aid
+    # Legacy SIM SELECT uses A0 and P2=00; UICC/USIM SELECT uses CLA=00,
+    # requesting the FCI template with P2=04 as before.
+    p2 = 0x04 if (by_aid or cla == 0x00) else 0x00
+    apdu = bytes([cla, 0xA4, p1, p2, len(fid_or_aid)]) + fid_or_aid
     label = f"SELECT {'AID' if by_aid else 'FID'} {fid_or_aid.hex()}"
     data, sw1, sw2 = transmit(conn, apdu, label, verbose)
     if (sw1, sw2) != (0x90, 0x00):
@@ -177,13 +209,42 @@ def find_usim_aid(conn, verbose: bool = True) -> str:
 # ---------------------------------------------------------------------------
 
 def run_gsm(conn, rand_hex: str, verbose: bool = True) -> dict:
+    """Run GSM authentication via USIM (CLA=00) when available, else classic SIM (CLA=A0)."""
     rand = h2b(rand_hex)
-    select(conn, h2b("3f00"), verbose=verbose)
-    select(conn, h2b("7f20"), verbose=verbose)
-    data, sw1, sw2 = transmit(conn, apdu_run_gsm(rand), "RUN GSM ALGORITHM", verbose)
-    if (sw1, sw2) != (0x90, 0x00):
-        raise RuntimeError(f"RUN GSM ALGORITHM failed: SW={sw1:02X}{sw2:02X}")
-    result = parse_run_gsm_resp(data)
+    if len(rand) != 16:
+        raise ValueError(f"RAND must be 16 bytes, got {len(rand)}")
+
+    # Prefer the USIM application when EF.DIR advertises a selectable USIM AID.
+    usim_aid = None
+    try:
+        usim_aid = find_usim_aid(conn, verbose=verbose)
+        select(conn, h2b(usim_aid), by_aid=True, verbose=verbose)
+    except RuntimeError as exc:
+        print(f"[*] No selectable ADF.USIM detected ({exc}); trying classic SIM path")
+        usim_aid = None
+
+    if usim_aid:
+        print(f"[*] Using USIM GSM context (CLA=00, AID={usim_aid})")
+        apdu = apdu_authenticate_gsm(rand)
+        data, sw1, sw2 = transmit(conn, apdu, "AUTHENTICATE (GSM context, USIM)", verbose)
+        if (sw1, sw2) != (0x90, 0x00):
+            raise RuntimeError(f"USIM AUTHENTICATE (GSM context) failed: SW={sw1:02X}{sw2:02X}")
+        result = parse_usim_gsm_resp(data)
+    else:
+        # Some cards accept UICC CLA=00 for SELECT even without a USIM applet;
+        # try that path first, then retry SELECT using legacy SIM CLA=A0.
+        try:
+            select(conn, h2b("3f00"), verbose=verbose)
+            select(conn, h2b("7f20"), verbose=verbose)
+        except RuntimeError:
+            select(conn, h2b("3f00"), verbose=verbose, cla=0xA0)
+            select(conn, h2b("7f20"), verbose=verbose, cla=0xA0)
+        print("[*] Using classic SIM RUN GSM ALGORITHM (CLA=A0)")
+        data, sw1, sw2 = transmit(conn, apdu_run_gsm(rand), "RUN GSM ALGORITHM", verbose)
+        if (sw1, sw2) != (0x90, 0x00):
+            raise RuntimeError(f"RUN GSM ALGORITHM failed: SW={sw1:02X}{sw2:02X}")
+        result = parse_run_gsm_resp(data)
+
     print(f"\nSRES = {result['sres'].hex()}")
     print(f"Kc   = {result['kc'].hex()}")
     return result
@@ -233,7 +294,7 @@ def main():
     p.add_argument("--list-readers", action="store_true", help="List connected PC/SC readers and exit")
     sub = p.add_subparsers(dest="mode")
 
-    gp = sub.add_parser("gsm", parents=[common], help="RUN GSM ALGORITHM (classic SIM, DF_GSM)")
+    gp = sub.add_parser("gsm", parents=[common], help="GSM authentication (auto-select USIM or classic SIM)")
     gp.add_argument("--rand", required=True, help="16-byte RAND, hex")
 
     up = sub.add_parser("umts", parents=[common], help="AUTHENTICATE / RUN UMTS AUTHENTICATION (USIM)")
