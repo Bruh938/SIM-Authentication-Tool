@@ -15,6 +15,7 @@ Usage:
   python sim_auth.py umts --rand <32 hex> --autn <32 hex>
   python sim_auth.py umts --rand <32 hex> --autn <32 hex> --aid a0000000871002...
   python sim_auth.py umts --rand <32 hex> --autn <32 hex> --reader 1 -q
+  python sim_auth.py umts --rand <32 hex> --gsm-context
 """
 
 import argparse
@@ -70,21 +71,30 @@ def parse_usim_gsm_resp(data: bytes) -> dict:
     return {"sres": sres, "kc": data[kc_start:kc_start + kc_len]}
 
 
-def apdu_authenticate(rand: bytes, autn: bytes, context: str = "3g") -> bytes:
-    """AUTHENTICATE, TS 31.102 sec 7.1.2.1. Must be sent under ADF.USIM.
-    CLA=00 INS=88 P1=00 P2=81(3g)/80(gsm) Lc=<len> LV(RAND) LV(AUTN) Le=00
-    context='gsm' runs 2G auth through the USIM (useful when the card has no
-    classic DF_GSM at all, which is common on modern-only UICCs).
+def apdu_authenticate(rand: bytes, autn: bytes | None = None,
+                      context: str = "3g") -> bytes:
+    """Build a USIM AUTHENTICATE APDU (3GPP TS 31.102 §7.1.2.1).
+
+    GSM context (P2=80) carries LV(RAND) only; AUTN is not sent and must be
+    omitted. 3G context (P2=81) carries LV(RAND) || LV(AUTN).
+    Must be sent after selecting ADF.USIM using CLA=00.
     """
     if len(rand) != 16:
         raise ValueError(f"RAND must be 16 bytes, got {len(rand)}")
-    if len(autn) != 16:
-        raise ValueError(f"AUTN must be 16 bytes, got {len(autn)}")
     if context not in ("3g", "gsm"):
         raise ValueError(f"context must be '3g' or 'gsm', got {context!r}")
-    p2 = 0x81 if context == "3g" else 0x80
+
+    if context == "gsm":
+        if autn is not None:
+            raise ValueError("AUTN must be omitted for GSM context; only LV(RAND) is sent")
+        return apdu_authenticate_gsm(rand)
+
+    if autn is None:
+        raise ValueError("AUTN is required for 3G context")
+    if len(autn) != 16:
+        raise ValueError(f"AUTN must be 16 bytes, got {len(autn)}")
     data = bytes([len(rand)]) + rand + bytes([len(autn)]) + autn
-    return bytes([0x00, 0x88, 0x00, p2, len(data)]) + data + bytes([0x00])
+    return bytes([0x00, 0x88, 0x00, 0x81, len(data)]) + data + bytes([0x00])
 
 
 def parse_authenticate_resp(data: bytes) -> dict:
@@ -250,18 +260,50 @@ def run_gsm(conn, rand_hex: str, verbose: bool = True) -> dict:
     return result
 
 
-def run_umts(conn, rand_hex: str, autn_hex: str, aid_hex: str = None,
-             context: str = "3g", verbose: bool = True) -> dict:
-    rand, autn = h2b(rand_hex), h2b(autn_hex)
+def run_umts(conn, rand_hex: str, autn_hex: str | None = None,
+             aid_hex: str = None, context: str = "3g",
+             verbose: bool = True) -> dict:
+    """Run USIM AUTHENTICATE in 3G or GSM context.
+
+    In 3G context, AUTN is required and the response is parsed as RES/CK/IK
+    (or AUTS on synchronisation failure). In GSM context, AUTN must be omitted;
+    the APDU carries only RAND and the response contains SRES and Kc.
+    """
+    if context not in ("3g", "gsm"):
+        raise ValueError(f"context must be '3g' or 'gsm', got {context!r}")
+
+    rand = h2b(rand_hex)
+    if len(rand) != 16:
+        raise ValueError(f"RAND must be 16 bytes, got {len(rand)}")
+
+    if context == "gsm":
+        if autn_hex is not None:
+            raise ValueError("--autn must be omitted with --gsm-context")
+        autn = None
+    else:
+        if autn_hex is None:
+            raise ValueError("--autn is required unless --gsm-context is used")
+        autn = h2b(autn_hex)
+        if len(autn) != 16:
+            raise ValueError(f"AUTN must be 16 bytes, got {len(autn)}")
+
     select(conn, h2b("3f00"), verbose=verbose)
     if not aid_hex:
         aid_hex = find_usim_aid(conn, verbose=verbose)
         print(f"[*] Discovered USIM AID: {aid_hex}")
     select(conn, h2b(aid_hex), by_aid=True, verbose=verbose)
+
     apdu = apdu_authenticate(rand, autn, context=context)
     data, sw1, sw2 = transmit(conn, apdu, f"AUTHENTICATE ({context})", verbose)
     if (sw1, sw2) != (0x90, 0x00):
-        raise RuntimeError(f"AUTHENTICATE failed: SW={sw1:02X}{sw2:02X}")
+        raise RuntimeError(f"AUTHENTICATE ({context}) failed: SW={sw1:02X}{sw2:02X}")
+
+    if context == "gsm":
+        result = parse_usim_gsm_resp(data)
+        print(f"\nSRES = {result['sres'].hex()}")
+        print(f"Kc   = {result['kc'].hex()}")
+        return result
+
     result = parse_authenticate_resp(data)
     if result["status"] == "success":
         print(f"\nRES = {result['res'].hex()}")
@@ -299,7 +341,7 @@ def main():
 
     up = sub.add_parser("umts", parents=[common], help="AUTHENTICATE / RUN UMTS AUTHENTICATION (USIM)")
     up.add_argument("--rand", required=True, help="16-byte RAND, hex")
-    up.add_argument("--autn", required=True, help="16-byte AUTN, hex")
+    up.add_argument("--autn", help="16-byte AUTN, hex (required for 3G context; omit with --gsm-context)")
     up.add_argument("--aid", help="ADF.USIM AID, hex (skips EF.DIR auto-discovery)")
     up.add_argument("--gsm-context", action="store_true",
                      help="Use GSM context (P2=80) instead of 3G context (P2=81), "
@@ -317,6 +359,12 @@ def main():
         p.print_help()
         sys.exit(1)
 
+    if args.mode == "umts":
+        if args.gsm_context and args.autn is not None:
+            up.error("--autn must be omitted with --gsm-context; GSM context uses RAND only")
+        if not args.gsm_context and args.autn is None:
+            up.error("--autn is required unless --gsm-context is specified")
+
     conn = get_connection(args.reader)
     try:
         if args.mode == "gsm":
@@ -324,7 +372,7 @@ def main():
         else:
             ctx = "gsm" if args.gsm_context else "3g"
             run_umts(conn, args.rand, args.autn, args.aid, context=ctx, verbose=not args.quiet)
-    except RuntimeError as e:
+    except (RuntimeError, ValueError) as e:
         sys.exit(f"[!] {e}")
     finally:
         conn.disconnect()
